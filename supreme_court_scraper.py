@@ -4,176 +4,349 @@ import csv
 import time
 import re
 import os
+from urllib.parse import urljoin
 
 # Create CSV file with headers
-csv_filename = "supreme_court_decisions.csv"
-headers = ["Case Number", "Case Title", "Facts", "Decision", "Ruling", "Verdict"]
-
-def create_csv():
-    if not os.path.exists(csv_filename):
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+def create_csv(filename):
+    if not os.path.exists(filename):
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=headers)
             writer.writeheader()
-        print(f"Created new CSV file: {csv_filename}")
+        print(f"Created new CSV file: {filename}")
 
 # Base URL
 base_url = "https://elibrary.judiciary.gov.ph"
 
-# Function to get all case links from a listing page
+# CSV headers
+headers = ["Case Number", "Case Title", "Facts", "Decision", "Ruling", "Verdict"]
+
+# Function to get all case links from a monthly listing page
 def get_case_links(url):
-    print(f"Accessing listing page: {url}")
+    print(f"Accessing monthly listing page: {url}")
     try:
-        response = requests.get(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         case_links = []
         
-        # Based on your screenshots, look for G.R. No. entries
-        # This gets all the links in the page
-        links = soup.find_all('a', href=lambda href: href and '/thebookshelf/showdocs/' in href)
+        # Find all G.R. No. cases in the page
+        gr_headers = soup.find_all(['a', 'div'], text=re.compile(r'G\.R\. No\. \d+'))
+        ac_headers = soup.find_all(['a', 'div'], text=re.compile(r'A\.C\. No\. \d+'))
         
-        # Process each link
-        for link in links:
-            # Check if the href already starts with http
-            if link['href'].startswith('http'):
-                case_url = link['href']  # Use as-is if it's already a full URL
+        # Combine all case headers
+        case_headers = gr_headers + ac_headers
+        
+        for case_header in case_headers:
+            # Check if it's directly a link
+            if case_header.name == 'a' and '/thebookshelf/showdocs/' in case_header.get('href', ''):
+                case_url = urljoin(base_url, case_header['href'])
+                case_title = case_header.text.strip()
+                case_links.append((case_url, case_title))
             else:
-                case_url = base_url + link['href']  # Only prepend base_url if needed
+                # Find the surrounding link
+                parent = case_header.parent
+                while parent and parent.name != 'a' and parent.name != 'body':
+                    parent = parent.parent
                 
-            # Store case title from the link text or nearby text
-            case_title = link.text.strip()
-            # Print for debugging
-            print(f"Found case link: {case_title}")
-            # Add to our list
-            case_links.append(case_url)
+                if parent and parent.name == 'a' and '/thebookshelf/showdocs/' in parent.get('href', ''):
+                    case_url = urljoin(base_url, parent['href'])
+                    case_title = case_header.text.strip()
+                    case_links.append((case_url, case_title))
+                
+                # Also check for links in sibling elements
+                siblings = case_header.find_next_siblings('a')
+                for sibling in siblings:
+                    if '/thebookshelf/showdocs/' in sibling.get('href', ''):
+                        case_url = urljoin(base_url, sibling['href'])
+                        case_title = case_header.text.strip() + " " + sibling.text.strip()
+                        case_links.append((case_url, case_title))
+                        break
         
-        return case_links
+        # If we didn't find case links with the method above, try another approach
+        if not case_links:
+            # Look for all links that contain showdocs in the URL
+            all_links = soup.find_all('a', href=lambda href: href and '/thebookshelf/showdocs/' in href)
+            
+            for link in all_links:
+                case_url = urljoin(base_url, link['href'])
+                case_title = link.text.strip()
+                if case_title:  # Only add if there's some text
+                    case_links.append((case_url, case_title))
+        
+        # Remove duplicates while preserving order
+        unique_links = []
+        seen = set()
+        for url, title in case_links:
+            if url not in seen:
+                seen.add(url)
+                unique_links.append((url, title))
+                print(f"Found case link: {title} at {url}")
+        
+        return unique_links
     except Exception as e:
         print(f"Error accessing listing page: {e}")
         return []
-    
-# Function to parse content from a case page
-def parse_case_page(url):
+
+def parse_case_page(url, title=""):
     print(f"Processing case: {url}")
     try:
+        # Initialize all variables with default values
+        case_number = ""
+        case_title = title  # Use the title passed from get_case_links if available
+        facts_section = ""
+        decision_section = ""
+        ruling_section = ""
+        verdict_section = ""
+
         # Validate URL first
         if not url.startswith('http'):
-            raise ValueError(f"Invalid URL format: {url}")
+            url = urljoin(base_url, url)
             
-        response = requests.get(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Extract case number
-        case_number = ""
-        case_number_element = soup.find(string=re.compile(r'G\.R\. Nos?\. \d+-?\d*'))
+        # Extract case number - look for both G.R. and A.C. numbers
+        gr_pattern = re.compile(r'G\.R\. No\. \d+-?\d*')
+        ac_pattern = re.compile(r'A\.C\. No\. \d+-?\d*')
+        
+        case_number_element = soup.find(string=gr_pattern)
+        if not case_number_element:
+            case_number_element = soup.find(string=ac_pattern)
+            
         if case_number_element:
             case_number = case_number_element.strip()
         else:
-            # Try finding it in the header section
-            header_section = soup.find('h1') or soup.find('h2') or soup.find('div', class_='case-header')
-            if header_section and 'G.R.' in header_section.text:
-                case_number = re.search(r'G\.R\. Nos?\. \d+-?\d*', header_section.text).group(0)
+            # Try to find case number in a different way
+            for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'div', 'p']):
+                text = element.get_text()
+                gr_match = gr_pattern.search(text)
+                ac_match = ac_pattern.search(text)
+                if gr_match:
+                    case_number = gr_match.group(0)
+                    break
+                elif ac_match:
+                    case_number = ac_match.group(0)
+                    break
         
-        # Extract case title
-        case_title = ""
-        # Look for text matching the pattern of parties (often in uppercase)
-        case_title_pattern = re.compile(r'([A-Z][A-Z\s.,]+\s+VS\.\s+[A-Z][A-Z\s.,]+)', re.IGNORECASE)
-        case_title_match = soup.find(string=case_title_pattern)
-        if case_title_match:
-            case_title = case_title_pattern.search(case_title_match).group(0)
+        # Extract case title if not already provided
+        if not case_title:
+            case_title_pattern = re.compile(r'([A-Z][A-Z\s.,]+\s+VS\.\s+[A-Z][A-Z\s.,]+)', re.IGNORECASE)
+            case_title_elements = soup.find_all(string=case_title_pattern)
+            
+            for element in case_title_elements:
+                match = case_title_pattern.search(element)
+                if match:
+                    case_title = match.group(0)
+                    break
         
-        # Find Facts section
-        facts_section = ""
-        facts_header = soup.find(string=re.compile(r'Factual Antecedents', re.IGNORECASE))
-        if facts_header:
-            # Get the parent container
-            facts_container = facts_header.parent
-            # Get the next sibling elements until we hit another heading
-            current = facts_container.find_next_sibling()
-            while current and not (current.name in ['h2', 'h3', 'h4'] or 
-                                  current.find(string=re.compile(r'DECISION|Our Ruling', re.IGNORECASE))):
-                facts_section += current.text.strip() + "\n"
-                current = current.find_next_sibling()
+        # Look for Antecedents or Facts section
+        facts_headers = ["Antecedents", "Antecedent", "ANTECEDENT", "ANTECEDENTS", "Factual Antecedents", "FACTUAL ANTECEDENTS" "Facts of the Case", "Antecedent Facts", "The Facts", "THE FACTS"]
+        for header_text in facts_headers:
+            # First try exact match
+            facts_header = soup.find(string=lambda text: text and header_text in text)
+            
+            # If not found, try case-insensitive match
+            if not facts_header:
+                pattern = re.compile(re.escape(header_text), re.IGNORECASE)
+                facts_header = soup.find(string=pattern)
+            
+            if facts_header:
+                # Try to get the parent element containing this text
+                facts_container = None
+                if hasattr(facts_header, 'find_parent'):
+                    facts_container = facts_header.find_parent(['p', 'div', 'h2', 'h3', 'h4'])
+                
+                if facts_container:
+                    # Extract text from this element and subsequent siblings until next section
+                    current = facts_container
+                    facts_section = current.get_text().strip() + "\n"
+                    
+                    current = current.find_next_sibling()
+                    while current and not is_section_boundary(current, ["Ruling", "Decision", "DECISION", "Discussion"]):
+                        facts_section += current.get_text().strip() + "\n"
+                        current = current.find_next_sibling()
+                break
         
         # Find Decision section
-        decision_section = ""
-        decision_header = soup.find(string=re.compile(r'DECISION', re.IGNORECASE))
-        if decision_header:
-            decision_container = decision_header.parent
-            current = decision_container.find_next_sibling()
-            while current and not (current.name in ['h2', 'h3', 'h4'] or 
-                                  current.find(string=re.compile(r'Our Ruling|WHEREFORE', re.IGNORECASE))):
-                decision_section += current.text.strip() + "\n"
-                current = current.find_next_sibling()
+        decision_headers = ["DECISION", "Decision"]
+        for header_text in decision_headers:
+            decision_header = soup.find(string=lambda text: text and header_text in text)
+            if not decision_header:
+                pattern = re.compile(re.escape(header_text), re.IGNORECASE)
+                decision_header = soup.find(string=pattern)
+                
+            if decision_header:
+                decision_container = None
+                if hasattr(decision_header, 'find_parent'):
+                    decision_container = decision_header.find_parent(['p', 'div', 'h2', 'h3', 'h4'])
+                
+                if decision_container:
+                    current = decision_container
+                    decision_section = current.get_text().strip() + "\n"
+                    
+                    current = current.find_next_sibling()
+                    while current and not is_section_boundary(current, ["WHEREFORE", "Conclusion", "FOR THESE REASONS"]):
+                        decision_section += current.get_text().strip() + "\n"
+                        current = current.find_next_sibling()
+                break
         
         # Find Ruling section
-        ruling_section = ""
-        ruling_header = soup.find(string=re.compile(r'Our Ruling', re.IGNORECASE))
-        if ruling_header:
-            ruling_container = ruling_header.parent
-            current = ruling_container.find_next_sibling()
-            while current and not (current.name in ['h2', 'h3', 'h4'] or 
-                                  current.find(string=re.compile(r'WHEREFORE', re.IGNORECASE))):
-                ruling_section += current.text.strip() + "\n"
-                current = current.find_next_sibling()
+        ruling_headers = ["Ruling", "RULING", "THE RULING", "Findings", "Court's Findings", "Ruling of the Court", "RULING OF THE COURT", "COURT'S RULING", "Court's Ruling"]
+        for header_text in ruling_headers:
+            ruling_header = soup.find(string=lambda text: text and header_text in text)
+            if not ruling_header:
+                pattern = re.compile(re.escape(header_text), re.IGNORECASE)
+                ruling_header = soup.find(string=pattern)
+                
+            if ruling_header:
+                ruling_container = None
+                if hasattr(ruling_header, 'find_parent'):
+                    ruling_container = ruling_header.find_parent(['p', 'div', 'h2', 'h3', 'h4'])
+                
+                if ruling_container:
+                    current = ruling_container
+                    ruling_section = current.get_text().strip() + "\n"
+                    
+                    current = current.find_next_sibling()
+                    while current and not is_section_boundary(current, ["WHEREFORE", "Conclusion", "FOR THESE REASONS"]):
+                        ruling_section += current.get_text().strip() + "\n"
+                        current = current.find_next_sibling()
+                break
         
-        # Find Verdict section
-        verdict_section = ""
-        verdict_header = soup.find(string=re.compile(r'WHEREFORE', re.IGNORECASE))
-        if verdict_header:
-            # The verdict is usually the paragraph containing "WHEREFORE"
-            verdict_container = verdict_header.parent
-            verdict_section = verdict_container.text.strip()
-            
-            # Also include "SO ORDERED" if it exists
-            so_ordered = soup.find(string=re.compile(r'SO ORDERED', re.IGNORECASE))
-            if so_ordered:
-                verdict_section += "\n" + so_ordered.strip()
+        # Get verdict section
+        verdict_section = get_verdict_section(soup)
         
         return {
-            "Case Number": case_number,
-            "Case Title": case_title,
-            "Facts": facts_section.strip(),
-            "Decision": decision_section.strip(),
-            "Ruling": ruling_section.strip(),
-            "Verdict": verdict_section.strip()
+            "Case Number": clean_text(case_number),
+            "Case Title": clean_text(case_title),
+            "Facts": clean_text(facts_section),
+            "Decision": clean_text(decision_section),
+            "Ruling": clean_text(ruling_section),
+            "Verdict": clean_text(verdict_section)
         }
+        
     except Exception as e:
         print(f"Error processing case page: {e}")
-        return {header: f"Error retrieving data: {str(e)[:100]}" for header in headers}
+        return {
+            "Case Number": f"Error retrieving data: {str(e)}",
+            "Case Title": title or f"Error retrieving data: {str(e)}",
+            "Facts": f"Error retrieving data: {str(e)}",
+            "Decision": f"Error retrieving data: {str(e)}",
+            "Ruling": f"Error retrieving data: {str(e)}",
+            "Verdict": f"Error retrieving data: {str(e)}"
+        }
 
-# Main function to run the scraper
-def scrape_cases(starting_url, max_cases=10):
-    create_csv()
+def is_section_boundary(element, section_titles):
+    if not element or not hasattr(element, 'name') or not element.name:
+        return True
+    if element.name in ['h2', 'h3', 'h4']:
+        return True
     
-    # Get case links from the listing page
-    case_links = get_case_links(starting_url)
+    if not hasattr(element, 'get_text'):
+        return True
+        
+    text = element.get_text().strip()
+    return any(title.lower() in text.lower() for title in section_titles)
+
+def clean_text(text):
+    if not text:
+        return ""
+    # Remove excessive whitespace and newlines
+    text = ' '.join(text.split())
+    # Remove page numbers or footers if present
+    text = re.sub(r'Page \d+ of \d+', '', text)
+    return text.strip()
+
+def get_verdict_section(soup):
+    verdict_markers = [
+        "WHEREFORE", "IN VIEW WHEREOF", "FOR THESE REASONS",
+        "ACCORDINGLY", "IN LIGHT OF THE FOREGOING",
+        "PREMISES CONSIDERED", "FOR THE FOREGOING REASONS"
+    ]
     
-    # Limit the number of cases to scrape if needed
-    if max_cases > 0 and len(case_links) > max_cases:
+    # Try to find any of the verdict markers
+    for marker in verdict_markers:
+        pattern = re.compile(re.escape(marker), re.IGNORECASE)
+        verdict_elements = soup.find_all(string=pattern)
+        
+        for verdict_element in verdict_elements:
+            if hasattr(verdict_element, 'find_parent'):
+                verdict_container = verdict_element.find_parent(['p', 'div'])
+                
+                if verdict_container:
+                    verdict_text = verdict_container.get_text().strip()
+                    
+                    # Include subsequent elements until "SO ORDERED" or concurring justices
+                    current = verdict_container.find_next_sibling()
+                    while current:
+                        current_text = current.get_text().strip()
+                        verdict_text += "\n" + current_text
+                        
+                        if "SO ORDERED" in current_text or "concur" in current_text.lower():
+                            break
+                            
+                        current = current.find_next_sibling()
+                    
+                    return clean_text(verdict_text)
+    
+    # Fallback: Look for penalty or disposition language
+    penalty_keywords = ["is found GUILTY", "is sentenced to", "is ordered to pay", "penalty of"]
+    for elem in soup.find_all(['p', 'div']):
+        text = elem.get_text().strip()
+        if any(keyword in text for keyword in penalty_keywords):
+            return clean_text(text)
+    
+    return "Verdict section not found"
+
+def scrape_month(month, year, max_cases=None):
+    # Create URL for the specified month and year
+    url = f"https://elibrary.judiciary.gov.ph/thebookshelf/docmonth/{month}/{year}/1"
+    
+    # Create a specific CSV file for this month
+    csv_filename = f"supreme_court_decisions_{month}_{year}.csv"
+    create_csv(csv_filename)
+    
+    print(f"\nScraping cases for {month} {year} from {url}")
+    
+    # Get case links from the monthly listing page
+    case_links = get_case_links(url)
+    
+    # Limit number of cases if specified
+    if max_cases and len(case_links) > max_cases:
         case_links = case_links[:max_cases]
-    
-    print(f"Found {len(case_links)} cases to process")
+        
+    print(f"Found {len(case_links)} cases for {month} {year}")
     
     # Process each case and save to CSV
+    cases_scraped = 0
     with open(csv_filename, 'a', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=headers)
         
-        for link in case_links:
+        for case_url, case_title in case_links:
             try:
-                case_data = parse_case_page(link)
+                case_data = parse_case_page(case_url, case_title)
                 writer.writerow(case_data)
-                print(f"Successfully scraped case: {case_data['Case Number']}")
+                cases_scraped += 1
+                print(f"Successfully scraped case {cases_scraped}/{len(case_links)}: {case_data['Case Number'] or case_title}")
                 
-                # Add a delay between requests to be respectful to the server
+                # Add a delay between requests
                 time.sleep(2)
             except Exception as e:
-                print(f"Error processing {link}: {e}")
+                print(f"Error processing {case_url}: {e}")
     
-    print(f"Scraping complete. Data saved to {csv_filename}")
+    print(f"\nScraping complete for {month} {year}. Total cases scraped: {cases_scraped}")
+    print(f"Data saved to {csv_filename}")
+    return cases_scraped
 
 if __name__ == "__main__":
-    # URL from your screenshot
-    starting_url = "https://elibrary.judiciary.gov.ph/thebookshelf/docmonth/Jan/2025/1"
+    # Example usage:
+    # To scrape February 2025 with no limit on number of cases:
+    scrape_month("Feb", 2025)
     
-    # Run the scraper
-    scrape_cases(starting_url, max_cases=5)  # Start with 5 cases as a test
+    # To scrape January 2025 with a limit of 5 cases:
+    # scrape_month("Jan", 2025, max_cases=5)
